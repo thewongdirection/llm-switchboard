@@ -68,11 +68,16 @@ async function loadLogs() {
 async function loadProjects() { const r = await api('/api/projects'); S.projects = r.projects; S.projectsRoot = r.root; renderLaunch(); }
 async function loadDiscover() { S.discover = await api('/api/discover'); renderDiscover(); renderCounts(); }
 async function loadDownloads() {
-  const prev = S.downloads;
+  const prev = S.downloads, firstLoad = !S.dlLoaded;
   S.downloads = (await api('/api/downloads')).downloads;
-  const finished = S.downloads.some(d => d.status === 'done' && !(prev.find(p => p.id === d.id)?.status === 'done'));
+  S.dlLoaded = true;
+  const active = list => list.filter(d => d.status === 'downloading').map(d => d.repo).sort().join('|');
+  // Downloads that finished while this page was open (not ones that finished before it loaded).
+  const finished = !firstLoad && S.downloads.some(d => d.status === 'done' && prev.find(p => p.id === d.id)?.status === 'downloading');
   if (finished) { toast('Download complete.'); await loadModels(); await loadDiscover(); }
-  if (S.tab === 'discover') renderDownloads();
+  // Row buttons ("Download" / "Downloading...") depend on which repos are active, so redraw when that set changes.
+  else if (S.tab === 'discover' && active(prev) !== active(S.downloads)) renderDiscover();
+  else if (S.tab === 'discover') renderDownloads();
 }
 
 // ---- status pill -----------------------------------------------------------
@@ -135,7 +140,8 @@ function renderHardware() {
   c.append(h('h2', {}, 'Hardware', h('span', { class: 'badge' }, e.source === 'manual' ? 'Manual' : 'Auto-detected')));
   c.append(h('dl', { class: 'kv' },
     h('dt', {}, 'GPU'), h('dd', {}, e.gpuName),
-    h('dt', {}, 'VRAM'), h('dd', {}, e.vramGB ? fmtGB(e.vramGB) + (e.freeVramGB != null ? ` (${fmtGB(e.freeVramGB)} free)` : '') : 'None'),
+    // Free VRAM comes from the real GPU, so it is meaningless next to a manually entered figure.
+    h('dt', {}, 'VRAM'), h('dd', {}, e.vramGB ? fmtGB(e.vramGB) + (e.source === 'detected' && e.freeVramGB != null ? ` (${fmtGB(e.freeVramGB)} free)` : '') : 'None'),
     h('dt', {}, 'RAM'), h('dd', {}, e.ramGB ? fmtGB(e.ramGB) : 'Unknown'),
     h('dt', {}, 'CPU'), h('dd', {}, e.cpuName ? `${e.cpuName}${e.cores ? ` (${e.cores}C/${e.threads}T)` : ''}` : 'Unknown')));
   c.append(h('div', { style: 'margin-top:12px;display:flex;gap:8px;align-items:center' },
@@ -250,7 +256,7 @@ function renderLaunch() {
 // ---- discover --------------------------------------------------------------
 function filteredDiscover() {
   const f = S.filters;
-  let items = S.discover.items.filter(i => i.tier !== 'toobig' || !f.fitOnly ? true : false);
+  let items = S.discover.items.slice();
   if (f.fitOnly) items = items.filter(i => i.tier !== 'toobig');
   if (f.hideVariants) items = items.filter(i => !i.variant);
   if (f.trustedOnly) items = items.filter(i => i.trusted);

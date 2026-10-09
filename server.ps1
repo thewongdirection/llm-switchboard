@@ -43,7 +43,16 @@ Save-Settings
 
 # ---- Hardware ---------------------------------------------------------------
 
+# Detection shells out to nvidia-smi and WMI (~0.5s), and the server is single-threaded, so cache it briefly.
+$script:HwCache = $null; $script:HwCacheAt = [datetime]::MinValue
 function Get-DetectedHardware {
+    if ($script:HwCache -and ((Get-Date) - $script:HwCacheAt).TotalSeconds -lt 5) { return $script:HwCache }
+    $script:HwCache = Get-DetectedHardwareRaw
+    $script:HwCacheAt = Get-Date
+    return $script:HwCache
+}
+
+function Get-DetectedHardwareRaw {
     $gpus = @()
     $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if ($smi) {
@@ -125,8 +134,8 @@ function Get-RepoFromPath([string]$Path) {
 function Get-InstalledModels($Hw) {
     $seenPaths = @{}
     $files = foreach ($dir in @($script:S.modelDirs)) {
-        if ($dir -and (Test-Path $dir)) {
-            Get-ChildItem $dir -Recurse -Depth 7 -Filter *.gguf -File -ErrorAction SilentlyContinue
+        if ($dir -and (Test-Path -LiteralPath $dir)) {
+            Get-ChildItem -LiteralPath $dir -Recurse -Depth 7 -Filter *.gguf -File -ErrorAction SilentlyContinue
         }
     }
     $mmprojByDir = @{}
@@ -146,6 +155,10 @@ function Get-InstalledModels($Hw) {
         $m.files++
         if ($f.Name -notmatch '(?i)-\d{5}-of-\d{5}\.gguf$' -or $f.Name -match '(?i)-0*1-of-\d+\.gguf$') { $m.main = $f.FullName }
     }
+    # A projector is only attached when it is unambiguous: one model in that folder. In a flat folder with
+    # several models it could belong to any of them, and a mismatched projector makes llama-server fail.
+    $perDir = @{}
+    foreach ($m in $models.Values) { if ($m.main) { $perDir[$m.dir] = 1 + [int]$perDir[$m.dir] } }
     $list = foreach ($m in $models.Values) {
         if (-not $m.main) { continue }
         $q = Get-QuantInfo $m.stem
@@ -153,7 +166,7 @@ function Get-InstalledModels($Hw) {
         $paramsB = Get-ParamsB $m.stem
         $sizeGB = [math]::Round($m.size / 1GB, 2)
         $fit = Get-Fit $sizeGB $isMoe $Hw
-        $mm = $mmprojByDir[$m.dir]
+        $mm = if ($perDir[$m.dir] -eq 1) { $mmprojByDir[$m.dir] } else { $null }
         @{
             path     = $m.main
             name     = $m.stem
@@ -177,11 +190,12 @@ function Get-InstalledModels($Hw) {
 
 # ---- llama-server lifecycle -------------------------------------------------
 
-$script:LlamaVersion = $null
+$script:LlamaVersion = $null; $script:LlamaVersionTried = $false
 function Get-LlamaVersion {
-    if ($script:LlamaVersion) { return $script:LlamaVersion }
+    if ($script:LlamaVersionTried) { return $script:LlamaVersion }
+    $script:LlamaVersionTried = $true   # don't re-run the exe on every poll if it fails
     $exe = $script:S.llamaServerPath
-    if ($exe -and (Test-Path $exe)) {
+    if ($exe -and (Test-Path -LiteralPath $exe)) {
         try { $script:LlamaVersion = ((& $exe --version 2>&1 | Out-String) -split "`n" | Where-Object { $_ -match 'version' } | Select-Object -First 1).Trim() } catch { }
     }
     return $script:LlamaVersion
@@ -211,9 +225,12 @@ function Get-ServerStatus {
     }
     $state = 'loading'
     try {
-        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$($st.port)/health" -TimeoutSec 1 -SkipHttpErrorCheck
-        if ($r.StatusCode -eq 200) { $state = 'ready' }
-    } catch { }
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$($st.port)/health" -TimeoutSec 2 -SkipHttpErrorCheck
+        if ($r.StatusCode -eq 200) { $state = 'ready'; $script:ReadyPid = [int]$st.pid }
+    } catch {
+        # A busy server can miss a health check; once a model has been Ready, don't flap back to Loading.
+        if ($script:ReadyPid -eq [int]$st.pid) { $state = 'ready' }
+    }
     return @{
         running = $true; state = $state; pid = $st.pid; port = $st.port; model = $st.model; modelPath = $st.modelPath
         alias = $st.alias; ctx = $st.ctx; startedAt = $st.startedAt; baseUrl = "http://127.0.0.1:$($st.port)"
@@ -265,12 +282,14 @@ function Start-LlamaServer($Req) {
     if ($ctx -lt 2048 -or $ctx -gt 1048576) { throw 'Context size out of range.' }
     $port = [int]$script:S.llamaPort
     $alias = $model.name
+    $inUse = $false
     $tcp = [Net.Sockets.TcpClient]::new()
-    try {
-        if ($tcp.ConnectAsync('127.0.0.1', $port).Wait(300)) {
-            throw "Port $port is already in use - another llama-server (not started from this dashboard) may be running. Stop it, or change the model server port in Settings."
-        }
-    } finally { $tcp.Dispose() }
+    try { $inUse = $tcp.ConnectAsync('127.0.0.1', $port).Wait(300) }
+    catch { $inUse = $false }   # connection refused (faulted task) means the port is free
+    finally { $tcp.Dispose() }
+    if ($inUse) {
+        throw "Port $port is already in use - another llama-server (not started from this dashboard) may be running. Stop it, or change the model server port in Settings."
+    }
 
     $a = @('-m', $model.path, '--alias', $alias, '--host', '127.0.0.1', '--port', "$port", '-c', "$ctx", '-np', '1', '--jinja', '-fa', 'on')
     if ($Req.kvQuant) { $a += @('-ctk', 'q8_0', '-ctv', 'q8_0') }
@@ -318,16 +337,17 @@ function Test-InsideProjects([string]$Dir) {
 # session can never inherit a local endpoint from a parent shell.
 $LocalEnvVars = @('ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
     'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL',
-    'CLAUDE_CODE_ATTRIBUTION_HEADER', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')
+    'CLAUDE_CODE_ATTRIBUTION_HEADER', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CODE_MAX_CONTEXT_TOKENS')
 
 function Start-ClaudeCode($Req) {
     $mode = if ($Req.mode -eq 'cloud') { 'cloud' } else { 'local' }
     $claude = Find-Claude
     if (-not $claude) { throw 'Claude Code CLI not found. Install it or set its path in Settings.' }
     $dir = [string]$Req.projectDir
-    if (-not $dir -or -not (Test-Path $dir -PathType Container) -or -not (Test-InsideProjects $dir)) { throw 'Choose a folder inside your projects folder.' }
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container) -or -not (Test-InsideProjects $dir)) { throw 'Choose a folder inside your projects folder.' }
     $dir = [IO.Path]::GetFullPath($dir)
     $claudeQ = $claude.Replace("'", "''")
+    $stopAfterLaunch = $false
 
     if ($mode -eq 'cloud') {
         $script = Join-Path $Data 'launch-claude-cloud.ps1'
@@ -337,8 +357,7 @@ function Start-ClaudeCode($Req) {
             "Write-Host 'Claude Code -> Anthropic cloud (local-model settings cleared)' -ForegroundColor Cyan",
             "& '$claudeQ'"
         )
-        $stopped = $false
-        if ($Req.stopLocal -and (Get-ServerStatus).running) { Stop-LlamaServer; $stopped = $true }
+        $stopAfterLaunch = [bool]($Req.stopLocal -and (Get-ServerStatus).running)
     } else {
         $srv = Get-ServerStatus
         if (-not $srv.running) { throw 'Start a model first.' }
@@ -356,6 +375,8 @@ function Start-ClaudeCode($Req) {
             "`$env:CLAUDE_CODE_SUBAGENT_MODEL = '$alias'",
             "`$env:CLAUDE_CODE_ATTRIBUTION_HEADER = '0'",
             "`$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'",
+            # Claude Code doesn't know local model names and would assume a 200k window and compact far too late.
+            "`$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = '$([int]$srv.ctx)'",
             "`$Host.UI.RawUI.WindowTitle = 'Claude Code - local: $alias'",
             "Write-Host 'Claude Code -> $($srv.baseUrl)  model: $alias' -ForegroundColor Cyan",
             "& '$claudeQ'"
@@ -370,7 +391,9 @@ function Start-ClaudeCode($Req) {
     } else {
         Start-Process $pwsh -ArgumentList $psArgs -WorkingDirectory $dir
     }
-    return @{ launched = $true; mode = $mode; dir = $dir; claude = $claude; stoppedLocal = [bool]$stopped }
+    # Only stop the local model once the cloud session has actually been launched.
+    if ($stopAfterLaunch) { Stop-LlamaServer }
+    return @{ launched = $true; mode = $mode; dir = $dir; claude = $claude; stoppedLocal = $stopAfterLaunch }
 }
 
 # ---- Hugging Face discovery -------------------------------------------------
@@ -466,6 +489,7 @@ $DiscJobScript = {
 
 function Start-DiscoverRefresh {
     if ($script:DiscJob -and $script:DiscJob.State -eq 'Running') { return }
+    if ($script:DiscJob) { Remove-Job $script:DiscJob -Force -ErrorAction SilentlyContinue }
     Write-Json $DiscStatusFile @{ state = 'running'; message = 'Starting...'; done = 0; total = 0; at = (Get-Date).ToString('o') }
     $script:DiscJob = Start-ThreadJob -ScriptBlock $DiscJobScript -ArgumentList (Join-Path $Root 'lib.ps1'), $DiscCacheFile, $DiscStatusFile, 150
 }
@@ -500,7 +524,10 @@ function Get-DiscoverView {
         $isMoe = Test-IsMoe $name
         $paramsB = [math]::Round($i.params / 1e9, 1)
         $age = $null
-        try { $age = [int]($now - [datetime]::Parse($i.createdAt)).TotalDays } catch { }
+        try {
+            $created = if ($i.createdAt -is [datetime]) { $i.createdAt } else { [datetime]::Parse([string]$i.createdAt, [Globalization.CultureInfo]::InvariantCulture) }
+            $age = [int]($now - $created).TotalDays
+        } catch { }
         $variant = [bool]($name -match '(?i)uncensor|abliterat|obliterat|decensor|derestrict|heretic|jailbreak|nsfw|roleplay|erp\b|humaniz|lobotom')
         $trusted = ($org -in $TrustedOrgs)
 
@@ -543,7 +570,7 @@ function Get-DiscoverView {
         }
     }
     return @{
-        items      = @($out | Where-Object { $_.tier -ne 'toobig' -or $true } | Sort-Object { $_.score } -Descending)
+        items      = @($out | Sort-Object { $_.score } -Descending)
         fetchedAt  = $script:DiscCache.fetchedAt
         status     = $status
         needsInput = $hwv.needsInput
@@ -553,6 +580,18 @@ function Get-DiscoverView {
 # ---- Downloads --------------------------------------------------------------
 
 $script:Downloads = @{}
+
+# Size of a remote file via HEAD (HF reports the real size of redirected LFS files in x-linked-size).
+function Get-RemoteSize([string]$Url) {
+    try {
+        $hdr = @(& curl.exe -sIL --max-time 15 $Url 2>$null)
+        $linked = $hdr | Where-Object { $_ -match '(?i)^x-linked-size:\s*\d+' } | Select-Object -Last 1
+        if ($linked -match '(\d+)\s*$') { return [int64]$Matches[1] }
+        $len = $hdr | Where-Object { $_ -match '(?i)^content-length:\s*\d+' } | Select-Object -Last 1
+        if ($len -match '(\d+)\s*$') { return [int64]$Matches[1] }
+    } catch { }
+    return [int64]0
+}
 
 function Start-ModelDownload($Req) {
     $repo = [string]$Req.repo
@@ -581,8 +620,14 @@ function Start-ModelDownload($Req) {
         $part = "$final.part"
         $err = Join-Path $Data "dl-$id-$n.err"
         $url = 'https://huggingface.co/' + $repo + '/resolve/main/' + (($f -split '/' | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/')
+        $size = [int64]($sizes[$f] ?? 0)
+        if ($size -le 0) { $size = Get-RemoteSize $url }   # sharded files: only the group total is cached
+        if ((Test-Path -LiteralPath $final) -and $size -gt 0 -and (Get-Item -LiteralPath $final).Length -eq $size) {
+            $dl.files += @{ name = $leaf; part = $part; final = $final; size = $size; proc = $null; errFile = $err; state = 'done' }   # already have it
+            $n++; continue
+        }
         $proc = Start-Process curl.exe -ArgumentList @('-L', '--fail', '-sS', '-C', '-', '--retry', '3', '-o', (Quote-Arg $part), $url) -WindowStyle Hidden -PassThru -RedirectStandardError $err
-        $dl.files += @{ name = $leaf; part = $part; final = $final; size = [int64]($sizes[$f] ?? 0); proc = $proc; errFile = $err; state = 'downloading' }
+        $dl.files += @{ name = $leaf; part = $part; final = $final; size = $size; proc = $proc; errFile = $err; state = 'downloading' }
         $n++
     }
     $script:Downloads[$id] = $dl
@@ -610,7 +655,14 @@ function Get-DownloadsView {
             if ($f.state -eq 'failed') { $failed = $f.error }
         }
         if ($dl.status -eq 'downloading') {
-            if ($failed) { $dl.status = 'failed'; $dl.error = $failed }
+            if ($failed) {
+                $dl.status = 'failed'; $dl.error = $failed
+                # One file failed, so the set is unusable: stop its siblings instead of leaving them running unseen.
+                foreach ($f in $dl.files) {
+                    if ($f.state -eq 'downloading' -and $f.proc -and -not $f.proc.HasExited) { Stop-Process -Id $f.proc.Id -Force -ErrorAction SilentlyContinue }
+                    if ($f.state -eq 'downloading') { $f.state = 'cancelled' }
+                }
+            }
             elseif ($allDone) { $dl.status = 'done' }
         }
         @{ id = $dl.id; repo = $dl.repo; status = $dl.status; error = $dl.error; doneBytes = $done; totalBytes = $total; files = @($dl.files | ForEach-Object { $_.name }) }
@@ -632,11 +684,13 @@ function Stop-ModelDownload([string]$Id) {
 # ---- Storage overview -------------------------------------------------------
 
 function Get-DirSize([string]$Path) {
-    if (-not (Test-Path $Path)) { return [int64]0 }
-    return [int64](Get-ChildItem $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    if (-not (Test-Path -LiteralPath $Path)) { return [int64]0 }
+    return [int64](Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
 }
 
-function Get-StorageView {
+# -NoSizes skips the (slow) recursive folder sizing; used when only the list of paths is needed.
+function Get-StorageView([switch]$NoSizes) {
+    if ($NoSizes) { function Get-DirSize { [int64]0 } }
     $hw = (Get-HardwareView).effective
     $models = @(Get-InstalledModels $hw)
     $items = [System.Collections.Generic.List[object]]::new()
@@ -689,10 +743,10 @@ function Get-StorageView {
 }
 
 function Open-InExplorer([string]$Path) {
-    $known = @((Get-StorageView).items | ForEach-Object { $_.path })
+    $known = @((Get-StorageView -NoSizes).items | ForEach-Object { $_.path })
     if ($Path -notin $known) { throw 'That location is not one of the dashboard''s storage paths.' }
-    if (-not (Test-Path $Path)) { throw 'That location does not exist yet.' }
-    if (Test-Path $Path -PathType Container) { Start-Process explorer.exe -ArgumentList (Quote-Arg $Path) }
+    if (-not (Test-Path -LiteralPath $Path)) { throw 'That location does not exist yet.' }
+    if (Test-Path -LiteralPath $Path -PathType Container) { Start-Process explorer.exe -ArgumentList (Quote-Arg $Path) }
     else { Start-Process explorer.exe -ArgumentList "/select,$(Quote-Arg $Path)" }
 }
 
@@ -725,10 +779,11 @@ function Read-Body($Ctx) {
 
 function Get-PublicState {
     $hwv = Get-HardwareView
+    $pub = @{}; foreach ($k in $script:S.Keys) { if ($k -ne 'seen') { $pub[$k] = $script:S[$k] } }   # 'seen' is a long internal ID list
     return @{
         hardware = $hwv
-        settings = $script:S
-        llama    = @{ path = $script:S.llamaServerPath; found = [bool]($script:S.llamaServerPath -and (Test-Path $script:S.llamaServerPath)); version = (Get-LlamaVersion) }
+        settings = $pub
+        llama    = @{ path = $script:S.llamaServerPath; found = [bool]($script:S.llamaServerPath -and (Test-Path -LiteralPath $script:S.llamaServerPath)); version = (Get-LlamaVersion) }
         claude   = @{ path = (Find-Claude) }
     }
 }
@@ -763,7 +818,8 @@ function Invoke-Api($Ctx, [string]$Method, [string]$Path) {
         'POST /api/download/cancel' { $b = Read-Body $Ctx; Stop-ModelDownload ([string]$b.id); return @{ ok = $true } }
         'POST /api/hardware' {
             $b = Read-Body $Ctx
-            if ($b.clear) { $script:S.hardwareOverride = $null }
+            # Index by key: `$b.clear` would resolve to Hashtable.Clear() (a truthy method) when the key is absent.
+            if ($b.ContainsKey('clear') -and $b['clear']) { $script:S.hardwareOverride = $null }
             else {
                 $vram = [double]$b.vramGB; $ram = [double]$b.ramGB
                 if ($vram -lt 0 -or $vram -gt 1024) { throw 'VRAM must be between 0 and 1024 GB.' }
@@ -777,14 +833,27 @@ function Invoke-Api($Ctx, [string]$Method, [string]$Path) {
         }
         'POST /api/settings' {
             $b = Read-Body $Ctx
-            foreach ($k in 'llamaServerPath', 'claudePath', 'downloadDir', 'projectsDir') { if ($b.ContainsKey($k)) { $script:S[$k] = ([string]$b[$k]).Trim() } }
-            if ($b.ContainsKey('modelDirs')) { $script:S.modelDirs = @($b.modelDirs | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
+            # Validate everything before changing anything, so a bad field can't leave settings half-applied.
+            $new = @{}
+            foreach ($k in 'llamaServerPath', 'claudePath', 'downloadDir', 'projectsDir') {
+                if (-not $b.ContainsKey($k)) { continue }
+                $v = ([string]$b[$k]).Trim()
+                if ($k -ne 'claudePath' -and -not $v) { throw "$k can't be empty." }
+                if ($v -and -not [IO.Path]::IsPathRooted($v)) { throw "$k must be a full path (like C:\...)." }
+                $new[$k] = $v
+            }
+            if ($b.ContainsKey('modelDirs')) {
+                $dirs = @($b.modelDirs | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+                foreach ($d in $dirs) { if (-not [IO.Path]::IsPathRooted($d)) { throw "Model folder '$d' must be a full path (like C:\...)." } }
+                $new['modelDirs'] = $dirs
+            }
+            foreach ($k in $new.Keys) { $script:S[$k] = $new[$k] }
             if ($b.ContainsKey('llamaPort')) {
                 $p = [int]$b.llamaPort
                 if ($p -lt 1024 -or $p -gt 65535) { throw 'Port must be 1024-65535.' }
                 $script:S.llamaPort = $p
             }
-            $script:LlamaVersion = $null
+            $script:LlamaVersion = $null; $script:LlamaVersionTried = $false
             Save-Settings
             return Get-PublicState
         }
