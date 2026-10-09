@@ -1,0 +1,5 @@
+# Local junk that should never be committed
+*.part
+*.log
+*.tmp
+.claude/
