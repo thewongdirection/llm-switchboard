@@ -346,6 +346,37 @@ function pollDiscover() {
   }, 2500);
 }
 
+// ---- storage ---------------------------------------------------------------
+const fmtBytes = n => n == null ? '' : n >= 2 ** 30 ? (n / 2 ** 30).toFixed(n >= 100 * 2 ** 30 ? 0 : 1) + ' GB' : n >= 2 ** 20 ? Math.round(n / 2 ** 20) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+async function loadStorage() { S.storage = await api('/api/storage'); renderStorage(); }
+function renderStorage() {
+  const p = $('#paneStorage'); p.replaceChildren();
+  const st = S.storage; if (!st) return;
+  p.append(h('div', { class: 'section-title' }, h('span', {}, 'Where everything is stored'),
+    h('button', { class: 'btn small', onclick: guard(loadStorage) }, 'Refresh')));
+  if (st.disks.length) p.append(h('div', { class: 'disks' }, st.disks.map(d => {
+    const used = (d.totalBytes - d.freeBytes) / d.totalBytes * 100;
+    return h('div', { class: 'disk' }, h('div', {}, h('strong', {}, d.drive + ' drive'), h('span', { class: 'sub' }, ` ${fmtBytes(d.freeBytes)} free of ${fmtBytes(d.totalBytes)}`)),
+      h('div', { class: 'progress' }, h('div', { style: `width:${used.toFixed(0)}%${used > 90 ? ';background:var(--bad)' : ''}` })));
+  })));
+  for (const group of ['Models', 'Model files', 'Programs', 'Dashboard']) {
+    const rows = st.items.filter(i => i.group === group); if (!rows.length) continue;
+    p.append(h('h3', { class: 'group-title' }, group));
+    for (const r of rows) {
+      p.append(h('div', { class: 'srow' + (r.exists ? '' : ' missing') },
+        h('div', {},
+          h('div', { class: 'name' }, r.label, r.sizeBytes != null ? h('span', { class: 'badge', style: 'margin-left:8px' }, fmtBytes(r.sizeBytes)) : null,
+            !r.exists && r.path ? h('span', { class: 'badge toobig', style: 'margin-left:6px' }, 'not found') : null),
+          h('code', { class: 'path' }, r.path || '(not set)'),
+          r.detail ? h('div', { class: 'meta' }, r.detail) : null),
+        h('div', { class: 'actions' },
+          r.path ? h('button', { class: 'btn small', onclick: () => { navigator.clipboard?.writeText(r.path).then(() => toast('Path copied.'), () => toast('Could not copy.', true)); } }, 'Copy') : null,
+          h('button', { class: 'btn small', disabled: !r.exists, onclick: guard(() => api('/api/storage/open', { path: r.path })) }, r.kind === 'file' ? 'Show in Explorer' : 'Open'))));
+    }
+  }
+  p.append(h('div', { class: 'hint', style: 'margin:14px 0 0;color:var(--muted);font-size:12.5px' }, 'Change model, download and project folders under Settings.'));
+}
+
 // ---- settings --------------------------------------------------------------
 function openSettings() {
   const s = S.app.settings, dlg = $('#dlgSettings');
@@ -375,7 +406,8 @@ function openSettings() {
 function setTab(t) {
   S.tab = t;
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
-  $('#paneInstalled').hidden = t !== 'installed'; $('#paneDiscover').hidden = t !== 'discover';
+  $('#paneInstalled').hidden = t !== 'installed'; $('#paneDiscover').hidden = t !== 'discover'; $('#paneStorage').hidden = t !== 'storage';
+  if (t === 'storage') loadStorage().catch(e => toast(e.message, true));
   if (t === 'discover') { loadDiscover().catch(() => { }); loadDownloads().catch(() => { }); if (S.discover.status?.state === 'running') pollDiscover(); }
 }
 document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));

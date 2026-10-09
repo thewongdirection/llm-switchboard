@@ -21,6 +21,12 @@ Closing the console stops the dashboard; a running model keeps running and is re
   then opens Claude Code in Windows Terminal in a project folder, pointed at the local model
   via `ANTHROPIC_BASE_URL` (llama-server speaks the Anthropic Messages API).
 
+- **Storage** - lists where everything lives (model folders and files, download folder, llama-server,
+  Claude CLI, dashboard data/logs, projects folder) with sizes, drive free space, and Copy / Open buttons.
+- **Cloud restore** - *Restore: launch with cloud Claude* opens a Claude Code session with the local-model
+  settings cleared (optionally stopping the local model). **Force stop** kills any llama-server, including
+  ones not started from the dashboard.
+
 ## Files
 
 | Path | Purpose |

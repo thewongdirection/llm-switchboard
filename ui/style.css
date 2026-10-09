@@ -101,6 +101,16 @@ a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: un
 .dl { padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); margin-bottom: 8px; display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; }
 .dl .meta { color: var(--muted); font-size: 12.5px; }
 
+.group-title { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 18px 0 8px; }
+.srow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 6px; }
+.srow.missing { opacity: .7; }
+.srow .name { font-weight: 600; word-break: break-all; }
+.srow .path { display: block; font: 12px Consolas, monospace; color: var(--muted); margin-top: 3px; word-break: break-all; user-select: all; }
+.srow .meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.srow .actions { display: flex; gap: 6px; }
+.disks { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; margin-bottom: 4px; }
+.disk { padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.disk .sub { color: var(--muted); font-size: 12.5px; }
 .kv { display: grid; grid-template-columns: 88px 1fr; gap: 6px 10px; margin: 0; }
 .kv dt { color: var(--muted); } .kv dd { margin: 0; font-weight: 500; word-break: break-word; }
 .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }

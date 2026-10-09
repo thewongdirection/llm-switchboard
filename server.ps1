@@ -160,6 +160,7 @@ function Get-InstalledModels($Hw) {
             repo     = (Get-RepoFromPath $m.main)
             quant    = $q.label
             sizeGB   = $sizeGB
+            sizeBytes = [int64]$m.size
             isMoe    = $isMoe
             paramsB  = $paramsB
             fit      = $fit
@@ -628,6 +629,73 @@ function Stop-ModelDownload([string]$Id) {
     $dl.status = 'cancelled'
 }
 
+# ---- Storage overview -------------------------------------------------------
+
+function Get-DirSize([string]$Path) {
+    if (-not (Test-Path $Path)) { return [int64]0 }
+    return [int64](Get-ChildItem $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+}
+
+function Get-StorageView {
+    $hw = (Get-HardwareView).effective
+    $models = @(Get-InstalledModels $hw)
+    $items = [System.Collections.Generic.List[object]]::new()
+    $add = {
+        param($group, $label, $path, $kind, $size, $detail)
+        $path = [string]$path
+        $items.Add(@{ group = $group; label = $label; path = $path; kind = $kind; exists = [bool]($path -and (Test-Path $path)); sizeBytes = $size; detail = $detail })
+    }
+
+    $dirs = @($script:S.modelDirs | Where-Object { $_ })
+    $dl = [string]$script:S.downloadDir
+    foreach ($d in $dirs) {
+        $under = @($models | Where-Object { $_.path.StartsWith($d.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) })
+        $bytes = [int64]($under | Measure-Object sizeBytes -Sum).Sum
+        $role = if ($d -ieq $dl) { 'Scanned for models - also where new downloads are saved' } else { 'Scanned for models' }
+        & $add 'Models' 'Model folder' $d 'dir' $bytes "$($under.Count) model$(if ($under.Count -ne 1) { 's' }) - $role"
+    }
+    if ($dl -and $dl -notin $dirs) {
+        & $add 'Models' 'Download folder' $dl 'dir' (Get-DirSize $dl) 'Where new downloads are saved'
+    }
+    $part = @(); if ($dl -and (Test-Path $dl)) { $part = @(Get-ChildItem $dl -Recurse -File -Filter *.part -ErrorAction SilentlyContinue) }
+    if ($part.Count) { & $add 'Models' 'Unfinished downloads' $dl 'dir' ([int64]($part | Measure-Object Length -Sum).Sum) "$($part.Count) .part file(s) - resume by downloading again" }
+    foreach ($m in $models) {
+        $label = if ($m.repo) { $m.repo } else { $m.name }
+        & $add 'Model files' $label $m.path 'file' $m.sizeBytes "$($m.quant)$(if ($m.mmproj) { ' - vision projector: ' + (Split-Path $m.mmproj -Leaf) })"
+    }
+
+    $llama = [string]$script:S.llamaServerPath
+    & $add 'Programs' 'llama-server' $llama 'file' $(if ($llama -and (Test-Path $llama)) { (Get-Item $llama).Length } else { $null }) (Get-LlamaVersion)
+    $claude = Find-Claude
+    & $add 'Programs' 'Claude Code CLI' $claude 'file' $(if ($claude -and (Test-Path $claude)) { (Get-Item $claude).Length } else { $null }) $(if ($claude) { 'Used by the launch buttons' } else { 'Not installed' })
+    & $add 'Programs' 'Claude Code settings & history' (Join-Path $HOME '.claude') 'dir' $null 'Your Claude Code config, sessions and memory'
+
+    & $add 'Dashboard' 'Dashboard data folder' $Data 'dir' (Get-DirSize $Data) 'Settings, logs and the model catalogue cache (outside the synced project folder)'
+    $files = @(
+        @($SettingsFile, 'Settings'), @($DiscCacheFile, 'Hugging Face catalogue cache'), @($ServerFile, 'Running-model record'),
+        @($LogErr, 'llama-server log (stderr)'), @($LogOut, 'llama-server log (stdout)'),
+        @((Join-Path $Data 'launch-claude.ps1'), 'Local-model Claude launcher'), @((Join-Path $Data 'launch-claude-cloud.ps1'), 'Cloud Claude launcher')
+    )
+    foreach ($f in $files) { if (Test-Path $f[0]) { & $add 'Dashboard' $f[1] $f[0] 'file' (Get-Item $f[0]).Length '' } }
+    & $add 'Dashboard' 'Dashboard application' $Root 'dir' (Get-DirSize $Root) 'The code you run with start.cmd'
+    & $add 'Dashboard' 'Projects folder' $script:S.projectsDir 'dir' $null 'Where Claude Code is launched from'
+
+    $disks = @()
+    $roots = @($dirs + $dl | Where-Object { $_ -and $_.Length -ge 2 -and $_[1] -eq ':' } | ForEach-Object { $_.Substring(0, 2).ToUpper() } | Select-Object -Unique)
+    foreach ($r in $roots) {
+        try { $di = [IO.DriveInfo]::new($r); $disks += @{ drive = $r; freeBytes = [int64]$di.AvailableFreeSpace; totalBytes = [int64]$di.TotalSize } } catch { }
+    }
+    return @{ items = @($items); disks = $disks }
+}
+
+function Open-InExplorer([string]$Path) {
+    $known = @((Get-StorageView).items | ForEach-Object { $_.path })
+    if ($Path -notin $known) { throw 'That location is not one of the dashboard''s storage paths.' }
+    if (-not (Test-Path $Path)) { throw 'That location does not exist yet.' }
+    if (Test-Path $Path -PathType Container) { Start-Process explorer.exe -ArgumentList (Quote-Arg $Path) }
+    else { Start-Process explorer.exe -ArgumentList "/select,$(Quote-Arg $Path)" }
+}
+
 # ---- HTTP plumbing ----------------------------------------------------------
 
 $Mime = @{ '.html' = 'text/html; charset=utf-8'; '.css' = 'text/css; charset=utf-8'; '.js' = 'text/javascript; charset=utf-8'; '.svg' = 'image/svg+xml'; '.json' = 'application/json'; '.ico' = 'image/x-icon' }
@@ -679,6 +747,8 @@ function Invoke-Api($Ctx, [string]$Method, [string]$Path) {
         'GET /api/logs' { $n = [int]($q['lines'] ?? 80); return @{ lines = @((Get-LogTail $LogErr $n) + (Get-LogTail $LogOut 10) | Select-Object -Last $n) } }
         'GET /api/projects' { return @{ root = $script:S.projectsDir; projects = @(Get-ProjectsView) } }
         'GET /api/discover' { return Get-DiscoverView }
+        'GET /api/storage' { return Get-StorageView }
+        'POST /api/storage/open' { $b = Read-Body $Ctx; Open-InExplorer ([string]$b.path); return @{ ok = $true } }
         'GET /api/downloads' { return @{ downloads = @(Get-DownloadsView) } }
         'POST /api/server/start' { return Start-LlamaServer (Read-Body $Ctx) }
         'POST /api/server/stop' { Stop-LlamaServer; return Get-ServerStatus }
