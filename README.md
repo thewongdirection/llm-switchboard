@@ -27,12 +27,36 @@ Closing the console stops the dashboard; a running model keeps running and is re
   settings cleared (optionally stopping the local model). **Force stop** kills any llama-server, including
   ones not started from the dashboard.
 
+- **256k context by default** - the dashboard reads each model's real architecture from its GGUF header
+  (layers, KV heads, sliding-window / hybrid layers) to estimate KV-cache memory, and defaults to the largest
+  window your VRAM + RAM can hold, capped at the model's trained length. It compresses the KV cache to 8-bit
+  automatically when full precision wouldn't stay on the GPU, and labels slow cases (a dense model that spills
+  into RAM). Override both under *Context window* / *KV cache*.
+- **Template patch** - some models (e.g. Qwen3.x) reject the mid-conversation system message Claude Code sends
+  (`System message must be at the beginning`). The dashboard detects this and starts such models with a patched
+  chat template (`--chat-template-file`); the original model file is never modified.
+
+## Testing
+
+`tests\verify-claude.ps1` checks, end to end, that the model started from the dashboard works through Claude Code:
+the server runs the selected file/context, the dashboard-launched terminal is correct, and headless Claude Code
+handles replies, reasoning, code generation (the generated code is then run), Read/Write/Edit/Bash tools,
+multi-turn memory, long-context recall and a two-file program. Start a model in the dashboard first, then:
+
+```
+pwsh -File tests\verify-claude.ps1            # all tests (slow for big models)
+pwsh -File tests\verify-claude.ps1 -Quick     # skip the long ones
+pwsh -File tests\verify-claude.ps1 -Only T4,T10
+```
+
 ## Files
 
 | Path | Purpose |
 | --- | --- |
 | `server.ps1` | HTTP server + API (binds to 127.0.0.1 only) |
 | `lib.ps1` | Name parsing, quant grouping and hardware-fit heuristics |
+| `gguf.ps1` | GGUF header reader, KV-cache / context planner, chat-template patching |
+| `tests/` | End-to-end Claude Code verification suite |
 | `ui/` | Static front end |
 | `%LOCALAPPDATA%\llm-switchboard\` | Settings, logs, catalogue cache (kept out of the synced folder) |
 

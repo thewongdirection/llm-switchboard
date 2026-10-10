@@ -16,7 +16,8 @@ function Write-Json([string]$Path, $Object) {
 # ---- Name parsing -----------------------------------------------------------
 
 function Get-QuantInfo([string]$FileName) {
-    $n = [IO.Path]::GetFileNameWithoutExtension($FileName) -replace '-\d{5}-of-\d{5}$', ''
+    # Only strip a real .gguf extension: names like "Qwen3.8-27B-UD-IQ4_XS" contain dots of their own.
+    $n = $FileName -replace '(?i)\.gguf$', '' -replace '-\d{5}-of-\d{5}$', ''
     $found = [regex]::Matches($n, '(?i)(?<![A-Za-z0-9])((?:UD-)?(?:IQ|Q)\d+(?:_[A-Z0-9]+)*|BF16|F16|F32|(?:MX|NV)FP4(?:_[A-Z0-9]+)*)(?![A-Za-z0-9])')
     if ($found.Count -eq 0) { return @{ label = 'unknown'; bits = 0; stem = $n } }
     $label = $found[$found.Count - 1].Groups[1].Value.ToUpper()

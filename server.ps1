@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $Root = $PSScriptRoot
 . (Join-Path $Root 'lib.ps1')
+. (Join-Path $Root 'gguf.ps1')
 
 $UiDir = Join-Path $Root 'ui'
 # Runtime data lives outside the (Synology-synced) project folder.
@@ -120,6 +121,16 @@ function Get-HardwareView {
     $eff.cpuName = $d.cpuName; $eff.cores = $d.cores; $eff.threads = $d.threads
     $eff.freeVramGB = if ($known.Count) { [math]::Round(($known | Measure-Object freeGB -Sum).Sum, 1) } else { $null }
     $eff.freeRamGB = $d.freeRamGB
+    # VRAM a model can really use = total minus what other programs (desktop, browser...) hold. That is measured
+    # whenever no llama-server is running, so our own models don't count against themselves.
+    if ($ov) {
+        $eff.gpuAvailGB = [math]::Max(0.0, $eff.vramGB - 1.0 - 0.3)
+    } elseif ($known.Count) {
+        if (-not (Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue)) {
+            $script:OtherVramGB = [math]::Max(0.0, $detectedVram - [double]$eff.freeVramGB)
+        }
+        $eff.gpuAvailGB = [math]::Round([math]::Max(0.0, $detectedVram - [double]($script:OtherVramGB ?? 1.0) - 0.3), 1)
+    } else { $eff.gpuAvailGB = 0.0 }
     return @{ detected = $d; effective = $eff; needsInput = $needsInput; override = $ov }
 }
 
@@ -162,9 +173,10 @@ function Get-InstalledModels($Hw) {
     $list = foreach ($m in $models.Values) {
         if (-not $m.main) { continue }
         $q = Get-QuantInfo $m.stem
-        $isMoe = Test-IsMoe $m.stem
         $paramsB = Get-ParamsB $m.stem
         $sizeGB = [math]::Round($m.size / 1GB, 2)
+        $plan = Get-CtxPlan $m.main ($m.size / 1GB) $Hw (Test-IsMoe $m.stem)   # reads real expert/layer counts from the file
+        $isMoe = $plan.isMoe
         $fit = Get-Fit $sizeGB $isMoe $Hw
         $mm = if ($perDir[$m.dir] -eq 1) { $mmprojByDir[$m.dir] } else { $null }
         @{
@@ -177,6 +189,8 @@ function Get-InstalledModels($Hw) {
             isMoe    = $isMoe
             paramsB  = $paramsB
             fit      = $fit
+            ctxPlan  = $plan
+            templatePatch = [bool](Get-PatchedTemplate $m.main)
             mmproj   = ($mm ? $mm.FullName : $null)
             modified = $m.modified.ToString('o')
             score    = (Get-ModelScore ($paramsB ?? [math]::Max($sizeGB * 1.6, 1)) $isMoe $fit)
@@ -233,7 +247,7 @@ function Get-ServerStatus {
     }
     return @{
         running = $true; state = $state; pid = $st.pid; port = $st.port; model = $st.model; modelPath = $st.modelPath
-        alias = $st.alias; ctx = $st.ctx; startedAt = $st.startedAt; baseUrl = "http://127.0.0.1:$($st.port)"
+        alias = $st.alias; ctx = $st.ctx; kvQuant = [bool]$st.kvQuant; templatePatched = [bool]$st.templatePatched; startedAt = $st.startedAt; baseUrl = "http://127.0.0.1:$($st.port)"
     }
 }
 
@@ -278,8 +292,17 @@ function Start-LlamaServer($Req) {
     $hw = (Get-HardwareView).effective
     $model = Get-InstalledModels $hw | Where-Object { $_.path -eq $Req.modelPath } | Select-Object -First 1
     if (-not $model) { throw 'That model is not in a configured model folder.' }
-    $ctx = [int]($Req.ctx ?? 32768)
-    if ($ctx -lt 2048 -or $ctx -gt 1048576) { throw 'Context size out of range.' }
+    # Context: 'auto' (default) = the largest window this machine can hold for this model, capped at its trained length.
+    $plan = $model.ctxPlan
+    if ($null -eq $Req.ctx -or "$($Req.ctx)" -eq 'auto') { $opt = $plan.recommended }
+    else {
+        $want = [int]$Req.ctx
+        if ($want -lt 2048 -or $want -gt 1048576) { throw 'Context size out of range.' }
+        $opt = $plan.options | Where-Object { $_.ctx -eq $want } | Select-Object -First 1
+        if (-not $opt) { $opt = @{ ctx = $want; kvQuant = $false } }
+    }
+    $ctx = [int]$opt.ctx
+    $kvq = if ($null -eq $Req.kvQuant -or "$($Req.kvQuant)" -eq 'auto') { [bool]$opt.kvQuant } else { [bool]$Req.kvQuant }
     $port = [int]$script:S.llamaPort
     $alias = $model.name
     $inUse = $false
@@ -292,7 +315,10 @@ function Start-LlamaServer($Req) {
     }
 
     $a = @('-m', $model.path, '--alias', $alias, '--host', '127.0.0.1', '--port', "$port", '-c', "$ctx", '-np', '1', '--jinja', '-fa', 'on')
-    if ($Req.kvQuant) { $a += @('-ctk', 'q8_0', '-ctv', 'q8_0') }
+    if ($kvq) { $a += @('-ctk', 'q8_0', '-ctv', 'q8_0') }
+    # Models whose chat template rejects Claude Code's mid-conversation system message get a patched template.
+    $tplFile = Get-TemplatePatchFile $model.path (Join-Path $Data 'templates')
+    if ($tplFile) { $a += @('--chat-template-file', $tplFile) }
     if ($Req.vision -and $model.mmproj) { $a += @('--mmproj', $model.mmproj) }
     if ($Req.extraArgs) { $a += @(([string]$Req.extraArgs).Trim() -split '\s+' | Where-Object { $_ }) }
 
@@ -301,7 +327,7 @@ function Start-LlamaServer($Req) {
         -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr -WorkingDirectory (Split-Path $exe)
     Write-Json $ServerFile @{
         pid = $proc.Id; startTicks = $proc.StartTime.ToFileTimeUtc(); port = $port; model = $model.name; modelPath = $model.path
-        alias = $alias; ctx = $ctx; startedAt = (Get-Date).ToString('o'); args = $a
+        alias = $alias; ctx = $ctx; kvQuant = $kvq; templatePatched = [bool]$tplFile; startedAt = (Get-Date).ToString('o'); args = $a
     }
     return Get-ServerStatus
 }

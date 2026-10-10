@@ -38,10 +38,11 @@ const fitBadge = fit => h('span', { class: 'badge ' + fit.tier, title: 'Estimate
 const S = {
   app: null, models: [], server: { state: 'stopped' }, discover: { items: [], status: {} }, downloads: [], projects: [],
   selected: localStorage.getItem('selectedModel') || null, tab: 'installed',
-  opts: JSON.parse(localStorage.getItem('launchOpts') || '{"ctx":32768,"kvQuant":false,"vision":false,"extraArgs":"","project":""}'),
+  // 'launchOpts2': context/KV default to "auto" (256k when feasible); older saved choices are not carried over.
+  opts: JSON.parse(localStorage.getItem('launchOpts2') || '{"ctx":"auto","kvQuant":"auto","vision":false,"extraArgs":"","project":""}'),
   filters: { q: '', fitOnly: true, hideVariants: true, trustedOnly: false, sort: 'rec' },
 };
-const saveOpts = () => localStorage.setItem('launchOpts', JSON.stringify(S.opts));
+const saveOpts = () => localStorage.setItem('launchOpts2', JSON.stringify(S.opts));
 
 // ---- data loading ----------------------------------------------------------
 async function loadApp() { S.app = await api('/api/state'); renderBanner(); renderHardware(); }
@@ -190,12 +191,33 @@ function renderLaunch() {
   if (srv.state === 'exited' && srv.error) c.append(h('div', { class: 'note error' }, h('strong', {}, 'Server exited'), h('pre', { style: 'margin:0;white-space:pre-wrap;font-size:12px;max-height:120px;overflow:auto' }, srv.error)));
 
   if (!busy) {
-    const ctx = h('select', { onchange: e => { S.opts.ctx = Number(e.target.value); saveOpts(); } },
-      [16384, 32768, 65536, 131072, 262144].map(v => h('option', { value: v, selected: v === S.opts.ctx }, `${(v / 1024)}k tokens${v === 32768 ? ' (recommended)' : ''}`)));
-    c.append(h('div', { class: 'field' }, h('label', {}, 'Context window'), ctx,
-      h('div', { class: 'hint' }, 'Claude Code sends large prompts; 32k is the practical minimum. Bigger uses more memory.')));
-    const kv = h('input', { type: 'checkbox', checked: S.opts.kvQuant, onchange: e => { S.opts.kvQuant = e.target.checked; saveOpts(); } });
-    c.append(h('label', { class: 'check' }, kv, 'Compress KV cache (q8) - saves memory'));
+    // Context window: "Auto" = the largest window this machine can hold for the selected model (256k when feasible).
+    const plan = m?.ctxPlan;
+    const k = v => v >= 1024 ? `${Math.round(v / 1024)}k` : String(v);
+    const speedText = o => !o.feasible ? "doesn't fit in memory" : o.speed === 'fast' ? 'fast' : o.speed === 'moderate' ? 'some spills to RAM' : 'slow - much spills to RAM';
+    const ctxSel = h('select', { onchange: e => { S.opts.ctx = e.target.value === 'auto' ? 'auto' : Number(e.target.value); saveOpts(); renderLaunch(); } },
+      h('option', { value: 'auto', selected: S.opts.ctx === 'auto' }, plan ? `Auto - ${k(plan.recommended.ctx)} (recommended)` : 'Auto'),
+      (plan?.options || []).slice().reverse().map(o => h('option', { value: o.ctx, selected: S.opts.ctx === o.ctx, disabled: !o.feasible }, `${k(o.ctx)} tokens - ${speedText(o)}`)));
+    const cur = plan && (S.opts.ctx === 'auto' ? plan.recommended : plan.options.find(o => o.ctx === S.opts.ctx));
+    let summary = 'Claude Code sends large prompts; a bigger window means fewer lost details but more memory.';
+    if (cur) {
+      const kvq = S.opts.kvQuant === 'auto' ? cur.kvQuant : S.opts.kvQuant;
+      const kvGB = kvq ? cur.kvQ8GB : cur.kvF16GB;
+      const where = !cur.feasible ? "This is too large for your memory." : cur.tier === 'gpu' ? 'Fits entirely on your GPU.'
+        : cur.tier === 'moe' ? 'Fits with some expert layers in system RAM - still fast.'
+          : cur.speed === 'fast' ? 'A small part spills into system RAM.'
+            : `About ${cur.offloadPct}% of the model and cache spills into system RAM, so generation will be slower.`;
+      summary = `${k(cur.ctx)} tokens needs about ${kvGB.toFixed(1)} GB of KV cache${kvq ? ' (8-bit compressed)' : ''}. ${where}`;
+      if (plan.trainedCtx && cur.ctx >= plan.trainedCtx) summary += ' (This is the model\'s maximum.)';
+    }
+    c.append(h('div', { class: 'field' }, h('label', {}, 'Context window'), ctxSel, h('div', { class: 'hint' }, summary)));
+    const kvSel = h('select', { onchange: e => { S.opts.kvQuant = e.target.value === 'auto' ? 'auto' : e.target.value === 'q8'; saveOpts(); renderLaunch(); } },
+      h('option', { value: 'auto', selected: S.opts.kvQuant === 'auto' }, 'Auto (compress only if needed)'),
+      h('option', { value: 'f16', selected: S.opts.kvQuant === false }, 'Full precision (f16)'),
+      h('option', { value: 'q8', selected: S.opts.kvQuant === true }, 'Compressed 8-bit (q8) - half the memory'));
+    c.append(h('div', { class: 'field' }, h('label', {}, 'KV cache'), kvSel));
+    if (m?.templatePatch) c.append(h('div', { class: 'hint', style: 'margin:-4px 0 12px;font-size:12px;color:var(--muted)' },
+      "This model's chat template rejects Claude Code's mid-conversation system message, so the dashboard starts it with a patched copy."));
     if (m?.mmproj) {
       const vis = h('input', { type: 'checkbox', checked: S.opts.vision, onchange: e => { S.opts.vision = e.target.checked; saveOpts(); } });
       c.append(h('label', { class: 'check' }, vis, 'Enable image input (loads vision projector)'));
