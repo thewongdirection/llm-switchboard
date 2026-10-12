@@ -219,5 +219,5 @@ function Get-CtxPlan([string]$Path, [double]$WeightsGB, $Hw, [bool]$IsMoeName) {
     }
     $feasible = @($options | Where-Object { $_.feasible })
     $rec = if ($feasible.Count) { $feasible | Sort-Object { $_.ctx } -Descending | Select-Object -First 1 } else { $options | Sort-Object { $_.ctx } | Select-Object -First 1 }
-    return @{ options = $options; recommended = $rec; trainedCtx = $trained; estimated = [bool]$kv; isMoe = $isMoe; perTokenKB = $(if ($kv) { [math]::Round($kv.perTokenBytes / 1024, 1) } else { $null }) }
+    return @{ options = $options; recommended = $rec; trainedCtx = $trained; estimated = [bool]$kv; isMoe = $isMoe; layers = $(if ($kv) { [int]$kv.layers } else { 0 }); perTokenKB = $(if ($kv) { [math]::Round($kv.perTokenBytes / 1024, 1) } else { $null }) }
 }
