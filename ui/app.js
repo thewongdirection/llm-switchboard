@@ -242,9 +242,13 @@ function renderLaunch() {
     const rec = m && cur ? (m.tunings || []).find(t => t.ctx === cur.ctx && !!t.kvQuant === !!kvEff) : null;
     const tuneBox = h('div', { class: 'tune' }, h('div', { class: 'tune-title' }, 'Speed tuning'));
     const runTune = quick => guard(async () => {
-      await api('/api/tune/start', { modelPath: m.path, ctx: S.opts.ctx, kvQuant: S.opts.kvQuant, quick });
+      await api('/api/tune/start', { modelPath: m.path, ctx: S.opts.ctx, kvQuant: S.opts.kvQuant, quick, marginMiB: S.opts.marginMiB || 1000 });
       toast('Autotune started - this takes several minutes.'); await loadTune(); pollTune();
     });
+    const marginSel = h('label', { class: 'check', title: 'VRAM a tuned setup must leave free. Lower = faster but less headroom for other programs.' }, 'Keep free VRAM: ',
+      h('select', { onchange: e => { S.opts.marginMiB = Number(e.target.value); saveOpts(); renderLaunch(); } },
+        ...[[512, '0.5 GB (fastest, tight)'], [1000, '1 GB (default)'], [1500, '1.5 GB'], [2000, '2 GB (safest)']].map(([v, t]) =>
+          h('option', { value: v, selected: (S.opts.marginMiB || 1000) === v }, t))));
     const pct = v => (v > 0 ? '+' : '') + v + '%';
     if (tn.state === 'running') {
       tuneBox.append(h('div', { class: 'progress' }, h('div', { style: `width:${tn.steps ? Math.min(95, Math.max(4, tn.step / tn.steps * 100)) : 6}%` })),
@@ -255,14 +259,17 @@ function renderLaunch() {
       tuneBox.append(h('div', { class: 'meta' }, `Reading prompts ${pct(rec.gainPromptPct)} (${Math.round(rec.baseline.prompt).toLocaleString()} → ${Math.round(rec.tuned.prompt).toLocaleString()} tok/s), writing ${pct(rec.gainGenPct)} (${rec.baseline.gen} → ${rec.tuned.gen} tok/s).`),
         h('label', { class: 'check' }, useT, 'Use tuned settings'),
         h('div', { class: 'hint-code' }, rec.cliArgs.join(' ')),
+        h('div', { class: 'meta' }, `Tuned keeping at least ${rec.marginMiB || 1000} MiB of VRAM free.`), marginSel,
         h('div', { class: 'row' }, h('button', { class: 'btn small', onclick: runTune(false) }, 'Re-run'),
           h('button', { class: 'btn small ghost', onclick: guard(async () => { await api('/api/tune/reset', { model: m.name }); await loadModels(); }) }, 'Reset')));
     } else if (rec) {
       tuneBox.append(h('div', { class: 'meta' }, 'Tested on this machine: nothing beat the default by a meaningful margin, so the default is kept.'),
+        marginSel,
         h('div', { class: 'row' }, h('button', { class: 'btn small', onclick: runTune(false) }, 'Re-run'),
           h('button', { class: 'btn small ghost', onclick: guard(async () => { await api('/api/tune/reset', { model: m.name }); await loadModels(); }) }, 'Reset')));
     } else {
       tuneBox.append(h('div', { class: 'meta' }, `Not tuned yet for ${cur ? k(cur.ctx) : 'this'} context. Tries a few GPU/CPU split, batch-size and thread settings and keeps the fastest safe combination (about 5-10 minutes; needs the GPU free).`),
+        marginSel,
         h('button', { class: 'btn small', disabled: !m || !S.app?.llama.found || !cur, onclick: runTune(false) }, 'Autotune this model'));
       if (tn.state === 'error' || tn.state === 'cancelled') tuneBox.append(h('div', { class: 'meta', style: 'color:var(--warn)' }, `Last run: ${tn.message || tn.state}`));
     }

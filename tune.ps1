@@ -40,6 +40,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 . (Join-Path $PSScriptRoot 'lib.ps1')
+$MarginMiB = Get-MarginMiB $MarginMiB
 $data = Join-Path $env:LOCALAPPDATA 'llm-switchboard'
 [void](New-Item -ItemType Directory -Force $data)
 if (-not $StatusFile) { $StatusFile = Join-Path $data 'tune-status.json' }
@@ -218,7 +219,7 @@ try {
     $gainPrompt = if ($base.prompt -gt 0) { [math]::Round(($win.prompt / $base.prompt - 1) * 100) } else { 0 }
     $useful = ($win -ne $base) -and ($win.score -gt $base.score * 1.03)
     $record = @{
-        savedAt = (Get-Date).ToString('o'); model = $modelName; ctx = $Ctx; kvQuant = [bool]$KvQuant; hw = $HwSig
+        savedAt = (Get-Date).ToString('o'); model = $modelName; ctx = $Ctx; kvQuant = [bool]$KvQuant; hw = $HwSig; marginMiB = $MarginMiB
         baseline = @{ gen = $base.gen; prompt = $base.prompt; freeMiB = $base.freeMiB }
         tuned = @{ gen = $win.gen; prompt = $win.prompt; freeMiB = $win.freeMiB }
         gainGenPct = $gainGen; gainPromptPct = $gainPrompt

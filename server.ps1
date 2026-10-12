@@ -326,7 +326,7 @@ function Get-ModelTunings([string]$ModelName, $Db, [string]$Sig) {
     @($Db.Keys | Where-Object { $_.StartsWith($ModelName + '|') -and $_.EndsWith($suffix) } | ForEach-Object {
             $r = $Db[$_]
             @{ ctx = $r.ctx; kvQuant = $r.kvQuant; savedAt = $r.savedAt; baseline = $r.baseline; tuned = $r.tuned; gainGenPct = $r.gainGenPct
-                gainPromptPct = $r.gainPromptPct; applied = $r.applied; note = $r.note; cliArgs = @($r.cliArgs) }
+                gainPromptPct = $r.gainPromptPct; marginMiB = $r.marginMiB; applied = $r.applied; note = $r.note; cliArgs = @($r.cliArgs) }
         })
 }
 
@@ -355,9 +355,11 @@ function Start-AutoTune($Req) {
     if ($model.ctxPlan.isMoe) { $a += '-IsMoe' }
     if ($tpl) { $a += @('-TemplateFile', (Quote-Arg $tpl)) }
     if ($Req.quick) { $a += '-Quick' }
+    $margin = Get-MarginMiB $Req.marginMiB
+    $a += @('-MarginMiB', "$margin")
     $p = Start-Process (Get-Process -Id $PID).Path -ArgumentList $a -WindowStyle Hidden -PassThru
     Write-Json $TuneStatusFile @{ state = 'running'; phase = 'starting'; message = 'Starting...'; pid = $p.Id; model = $model.name; ctx = $lp.ctx
-        kvQuant = $lp.kvq; step = 0; steps = 12; trials = @(); startedAt = (Get-Date).ToString('o') }
+        kvQuant = $lp.kvq; marginMiB = $margin; step = 0; steps = 12; trials = @(); startedAt = (Get-Date).ToString('o') }
     return @{ started = $true; ctx = $lp.ctx; kvQuant = $lp.kvq }
 }
 

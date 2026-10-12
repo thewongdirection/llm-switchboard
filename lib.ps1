@@ -91,3 +91,14 @@ function Get-ModelScore([double]$ParamsB, [bool]$IsMoe, $Fit) {
     $eff = if ($IsMoe) { $ParamsB * 0.7 } else { $ParamsB }
     return $Fit.weight + 1.5 * [math]::Log([math]::Max($eff, 1.0))
 }
+
+# ---- Autotune VRAM margin ---------------------------------------------------
+# How much VRAM a tuned configuration must leave free. Clamped so a bad request cannot disable the safety check.
+
+$script:MarginMinMiB = 256; $script:MarginMaxMiB = 4096; $script:MarginDefaultMiB = 1000
+
+function Get-MarginMiB($Value) {
+    $n = 0
+    if ($null -eq $Value -or -not [int]::TryParse([string]$Value, [ref]$n)) { return $script:MarginDefaultMiB }
+    return [math]::Min($script:MarginMaxMiB, [math]::Max($script:MarginMinMiB, $n))
+}
