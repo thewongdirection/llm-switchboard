@@ -44,10 +44,21 @@ handles replies, reasoning, code generation (the generated code is then run), Re
 multi-turn memory, long-context recall and a two-file program. Start a model in the dashboard first, then:
 
 ```
-pwsh -File tests\verify-claude.ps1            # all tests (slow for big models)
-pwsh -File tests\verify-claude.ps1 -Quick     # skip the long ones
-pwsh -File tests\verify-claude.ps1 -Only T4,T10
+pwsh -File tests\verify-claude.ps1 -Model gemma -StopAfter   # launch a model via the dashboard, test it, stop it
+pwsh -File tests\verify-claude.ps1                           # test whichever dashboard-started model is Ready
+pwsh -File tests\verify-claude.ps1 -Quick                    # skip the long ones
+pwsh -File tests\verify-claude.ps1 -Only D4,V1,T4
 ```
+
+The test runs the model through direct checks first (health, a plain prompt, the Anthropic endpoint, writing code that is
+then executed), opens a real terminal where Claude Code works on a first task (verified from Claude Code's debug log), and
+then drives Claude Code headless through tool-use and coding tasks. For speed it launches with the account connectors
+switched off (`disableConnectors`) - normal dashboard launches keep them.
+
+**The test cleans up after itself.** The terminal tab it opens gets a unique `SB-TEST-nnnnn` title and is closed through
+Windows Terminal when the run ends - on success, failure, error or Ctrl+C - along with any process still running in it, its
+temp files and (with `-StopAfter`) the model. Pass `-KeepTerminal` to leave the tab open for inspection. If a run is
+hard-killed (so it cannot clean up), run `pwsh -File tests\close-test-terminals.ps1`, which closes only `SB-TEST-*` tabs.
 
 ## Files
 

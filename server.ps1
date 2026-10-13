@@ -170,6 +170,7 @@ function Get-InstalledModels($Hw) {
     # several models it could belong to any of them, and a mismatched projector makes llama-server fail.
     $perDir = @{}
     foreach ($m in $models.Values) { if ($m.main) { $perDir[$m.dir] = 1 + [int]$perDir[$m.dir] } }
+    $tuneDb = Read-Json $TuneDbFile @{}; $tuneSig = Get-HwSig
     $list = foreach ($m in $models.Values) {
         if (-not $m.main) { continue }
         $q = Get-QuantInfo $m.stem
@@ -191,6 +192,7 @@ function Get-InstalledModels($Hw) {
             fit      = $fit
             ctxPlan  = $plan
             templatePatch = [bool](Get-PatchedTemplate $m.main)
+            tunings  = @(Get-ModelTunings $m.stem $tuneDb $tuneSig)
             mmproj   = ($mm ? $mm.FullName : $null)
             modified = $m.modified.ToString('o')
             score    = (Get-ModelScore ($paramsB ?? [math]::Max($sizeGB * 1.6, 1)) $isMoe $fit)
@@ -235,7 +237,7 @@ function Get-ServerStatus {
     $alive = $p -and $p.ProcessName -like 'llama-server*' -and $p.StartTime.ToFileTimeUtc() -eq [int64]$st.startTicks
     if (-not $alive) {
         $tail = @(Get-LogTail $LogErr 12)
-        return @{ running = $false; state = 'exited'; model = $st.model; error = ($tail -join "`n") }
+        return @{ running = $false; state = 'exited'; model = $st.model; tuned = [bool]$st.tuned; error = ($tail -join "`n") }
     }
     $state = 'loading'
     try {
@@ -247,7 +249,7 @@ function Get-ServerStatus {
     }
     return @{
         running = $true; state = $state; pid = $st.pid; port = $st.port; model = $st.model; modelPath = $st.modelPath
-        alias = $st.alias; ctx = $st.ctx; kvQuant = [bool]$st.kvQuant; templatePatched = [bool]$st.templatePatched; startedAt = $st.startedAt; baseUrl = "http://127.0.0.1:$($st.port)"
+        alias = $st.alias; ctx = $st.ctx; kvQuant = [bool]$st.kvQuant; templatePatched = [bool]$st.templatePatched; tuned = [bool]$st.tuned; startedAt = $st.startedAt; baseUrl = "http://127.0.0.1:$($st.port)"
     }
 }
 
@@ -285,15 +287,10 @@ function Stop-AllLlamaServers {
 
 function Quote-Arg([string]$a) { if ($a -match '\s') { return '"' + $a + '"' } return $a }
 
-function Start-LlamaServer($Req) {
-    if ((Get-ServerStatus).running) { throw 'A model server is already running. Stop it first.' }
-    $exe = $script:S.llamaServerPath
-    if (-not $exe -or -not (Test-Path $exe)) { throw 'llama-server.exe not found. Set its path in Settings.' }
-    $hw = (Get-HardwareView).effective
-    $model = Get-InstalledModels $hw | Where-Object { $_.path -eq $Req.modelPath } | Select-Object -First 1
-    if (-not $model) { throw 'That model is not in a configured model folder.' }
-    # Context: 'auto' (default) = the largest window this machine can hold for this model, capped at its trained length.
-    $plan = $model.ctxPlan
+# Context: 'auto' (default) = the largest window this machine can hold for this model, capped at its trained length.
+# KV cache: 'auto' = compress to 8-bit only when full precision would not stay on the GPU.
+function Resolve-LaunchPlan($Model, $Req) {
+    $plan = $Model.ctxPlan
     if ($null -eq $Req.ctx -or "$($Req.ctx)" -eq 'auto') { $opt = $plan.recommended }
     else {
         $want = [int]$Req.ctx
@@ -301,8 +298,96 @@ function Start-LlamaServer($Req) {
         $opt = $plan.options | Where-Object { $_.ctx -eq $want } | Select-Object -First 1
         if (-not $opt) { $opt = @{ ctx = $want; kvQuant = $false } }
     }
-    $ctx = [int]$opt.ctx
     $kvq = if ($null -eq $Req.kvQuant -or "$($Req.kvQuant)" -eq 'auto') { [bool]$opt.kvQuant } else { [bool]$Req.kvQuant }
+    return @{ ctx = [int]$opt.ctx; kvq = $kvq }
+}
+
+# ---- Autotune (see tune.ps1) ------------------------------------------------
+
+$TuneStatusFile = Join-Path $Data 'tune-status.json'
+$TuneDbFile = Join-Path $Data 'tuning.json'
+
+# Tuning only applies to the machine and llama.cpp build it was measured on.
+function Get-HwSig {
+    $e = (Get-HardwareView).effective
+    return ('{0}|{1}|{2}|{3}' -f $e.gpuName, [math]::Round($e.vramGB), [math]::Round($e.ramGB), (Get-LlamaVersion))
+}
+
+function Get-TuningRecord([string]$ModelName, [int]$Ctx, [bool]$Kvq) {
+    $db = Read-Json $TuneDbFile @{}
+    $key = '{0}|{1}|{2}|{3}' -f $ModelName, $Ctx, [int]$Kvq, (Get-HwSig)
+    if ($db.ContainsKey($key)) { return $db[$key] }
+    return $null
+}
+
+# Slim summaries of this model's tunings for the current hardware (the list endpoint must stay small).
+function Get-ModelTunings([string]$ModelName, $Db, [string]$Sig) {
+    $suffix = '|' + $Sig
+    @($Db.Keys | Where-Object { $_.StartsWith($ModelName + '|') -and $_.EndsWith($suffix) } | ForEach-Object {
+            $r = $Db[$_]
+            @{ ctx = $r.ctx; kvQuant = $r.kvQuant; savedAt = $r.savedAt; baseline = $r.baseline; tuned = $r.tuned; gainGenPct = $r.gainGenPct
+                gainPromptPct = $r.gainPromptPct; marginMiB = $r.marginMiB; applied = $r.applied; note = $r.note; cliArgs = @($r.cliArgs) }
+        })
+}
+
+function Get-TuneStatus {
+    $st = Read-Json $TuneStatusFile @{ state = 'idle' }
+    if ($st.state -eq 'running') {
+        $p = Get-Process -Id ([int]$st.pid) -ErrorAction SilentlyContinue
+        if (-not $p -or $p.ProcessName -notlike 'pwsh*') { $st.state = 'error'; $st.message = 'The autotune stopped unexpectedly.' }
+    }
+    return $st
+}
+
+function Start-AutoTune($Req) {
+    if ((Get-TuneStatus).state -eq 'running') { throw 'An autotune is already running.' }
+    if ((Get-ServerStatus).running -or @(Get-LlamaProcesses).Count) { throw 'Stop every running model server first - the autotune needs the GPU to itself.' }
+    $exe = $script:S.llamaServerPath
+    if (-not $exe -or -not (Test-Path $exe)) { throw 'llama-server.exe not found. Set its path in Settings.' }
+    $model = Get-InstalledModels (Get-HardwareView).effective | Where-Object { $_.path -eq $Req.modelPath } | Select-Object -First 1
+    if (-not $model) { throw 'That model is not in a configured model folder.' }
+    $lp = Resolve-LaunchPlan $model $Req
+    $tpl = Get-TemplatePatchFile $model.path (Join-Path $Data 'templates')
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Quote-Arg (Join-Path $Root 'tune.ps1')),
+        '-ModelPath', (Quote-Arg $model.path), '-ModelName', (Quote-Arg $model.name), '-Ctx', "$($lp.ctx)", '-LlamaServer', (Quote-Arg $exe),
+        '-Port', "$([int]$script:S.llamaPort + 100)", '-HwSig', (Quote-Arg (Get-HwSig)), '-Layers', "$([int]$model.ctxPlan.layers)")
+    if ($lp.kvq) { $a += '-KvQuant' }
+    if ($model.ctxPlan.isMoe) { $a += '-IsMoe' }
+    if ($tpl) { $a += @('-TemplateFile', (Quote-Arg $tpl)) }
+    if ($Req.quick) { $a += '-Quick' }
+    $margin = Get-MarginMiB $Req.marginMiB
+    $a += @('-MarginMiB', "$margin")
+    $p = Start-Process (Get-Process -Id $PID).Path -ArgumentList $a -WindowStyle Hidden -PassThru
+    Write-Json $TuneStatusFile @{ state = 'running'; phase = 'starting'; message = 'Starting...'; pid = $p.Id; model = $model.name; ctx = $lp.ctx
+        kvQuant = $lp.kvq; marginMiB = $margin; step = 0; steps = 12; trials = @(); startedAt = (Get-Date).ToString('o') }
+    return @{ started = $true; ctx = $lp.ctx; kvQuant = $lp.kvq }
+}
+
+function Stop-AutoTune {
+    $st = Get-TuneStatus
+    if ($st.state -eq 'running' -and $st.pid) {
+        $p = Get-Process -Id ([int]$st.pid) -ErrorAction SilentlyContinue
+        if ($p -and $p.ProcessName -like 'pwsh*') { & taskkill /T /F /PID $p.Id 2>&1 | Out-Null }   # the whole tree, including the trial llama-server
+        Write-Json $TuneStatusFile @{ state = 'cancelled'; phase = 'cancelled'; message = 'Cancelled.'; model = $st.model; ctx = $st.ctx; trials = @($st.trials) }
+    }
+}
+
+function Reset-Tuning([string]$ModelName) {
+    $db = Read-Json $TuneDbFile @{}
+    foreach ($k in @($db.Keys | Where-Object { $_.StartsWith($ModelName + '|') })) { $db.Remove($k) }
+    Write-Json $TuneDbFile $db
+}
+
+function Start-LlamaServer($Req) {
+    if ((Get-ServerStatus).running) { throw 'A model server is already running. Stop it first.' }
+    if ((Get-TuneStatus).state -eq 'running') { throw 'An autotune is running. Wait for it to finish, or cancel it.' }
+    $exe = $script:S.llamaServerPath
+    if (-not $exe -or -not (Test-Path $exe)) { throw 'llama-server.exe not found. Set its path in Settings.' }
+    $hw = (Get-HardwareView).effective
+    $model = Get-InstalledModels $hw | Where-Object { $_.path -eq $Req.modelPath } | Select-Object -First 1
+    if (-not $model) { throw 'That model is not in a configured model folder.' }
+    $lp = Resolve-LaunchPlan $model $Req
+    $ctx = $lp.ctx; $kvq = $lp.kvq
     $port = [int]$script:S.llamaPort
     $alias = $model.name
     $inUse = $false
@@ -319,6 +404,12 @@ function Start-LlamaServer($Req) {
     # Models whose chat template rejects Claude Code's mid-conversation system message get a patched template.
     $tplFile = Get-TemplatePatchFile $model.path (Join-Path $Data 'templates')
     if ($tplFile) { $a += @('--chat-template-file', $tplFile) }
+    # Settings found by the autotune for this exact model, context, KV type and machine (opt out with useTuned = false).
+    $tuned = $false
+    if ($Req.useTuned -ne $false) {
+        $rec = Get-TuningRecord $model.name $ctx $kvq
+        if ($rec -and $rec.applied -and @($rec.cliArgs).Count) { $a += @($rec.cliArgs | ForEach-Object { [string]$_ }); $tuned = $true }
+    }
     if ($Req.vision -and $model.mmproj) { $a += @('--mmproj', $model.mmproj) }
     if ($Req.extraArgs) { $a += @(([string]$Req.extraArgs).Trim() -split '\s+' | Where-Object { $_ }) }
 
@@ -327,7 +418,7 @@ function Start-LlamaServer($Req) {
         -RedirectStandardOutput $LogOut -RedirectStandardError $LogErr -WorkingDirectory (Split-Path $exe)
     Write-Json $ServerFile @{
         pid = $proc.Id; startTicks = $proc.StartTime.ToFileTimeUtc(); port = $port; model = $model.name; modelPath = $model.path
-        alias = $alias; ctx = $ctx; kvQuant = $kvq; templatePatched = [bool]$tplFile; startedAt = (Get-Date).ToString('o'); args = $a
+        alias = $alias; ctx = $ctx; kvQuant = $kvq; templatePatched = [bool]$tplFile; tuned = $tuned; startedAt = (Get-Date).ToString('o'); args = $a
     }
     return Get-ServerStatus
 }
@@ -363,7 +454,8 @@ function Test-InsideProjects([string]$Dir) {
 # session can never inherit a local endpoint from a parent shell.
 $LocalEnvVars = @('ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
     'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL',
-    'CLAUDE_CODE_ATTRIBUTION_HEADER', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CODE_MAX_CONTEXT_TOKENS')
+    'CLAUDE_CODE_ATTRIBUTION_HEADER', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+    'ENABLE_CLAUDEAI_MCP_SERVERS')
 
 function Start-ClaudeCode($Req) {
     $mode = if ($Req.mode -eq 'cloud') { 'cloud' } else { 'local' }
@@ -374,6 +466,20 @@ function Start-ClaudeCode($Req) {
     $dir = [IO.Path]::GetFullPath($dir)
     $claudeQ = $claude.Replace("'", "''")
     $stopAfterLaunch = $false
+    # Optional first message: the terminal opens already working on it, so the session is visibly alive.
+    $initial = ([string]$Req.initialPrompt -replace '\s+', ' ').Trim()
+    if ($initial.Length -gt 4000) { throw 'initialPrompt is too long (max 4000 characters).' }
+    if ($initial.StartsWith('-')) { throw 'initialPrompt must not start with "-".' }
+    $promptArg = if ($initial) { " '" + $initial.Replace("'", "''") + "'" } else { '' }
+    # Opt-in (the tests use it): have Claude Code write a debug log we can read to verify what the visible session did.
+    # The path is generated here, never taken from the request.
+    $debugArg = ''; $debugPath = $null
+    if ($Req.debugLog) {
+        $dd = Join-Path $Data 'debug'; [void](New-Item -ItemType Directory -Force $dd)
+        Get-ChildItem $dd -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | ForEach-Object { [IO.File]::Delete($_.FullName) }
+        $debugPath = Join-Path $dd ('claude-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $debugArg = " --debug-file '" + $debugPath.Replace("'", "''") + "'"
+    }
 
     if ($mode -eq 'cloud') {
         $script = Join-Path $Data 'launch-claude-cloud.ps1'
@@ -381,7 +487,7 @@ function Start-ClaudeCode($Req) {
         $lines += @(
             "`$Host.UI.RawUI.WindowTitle = 'Claude Code - cloud'",
             "Write-Host 'Claude Code -> Anthropic cloud (local-model settings cleared)' -ForegroundColor Cyan",
-            "& '$claudeQ'"
+            "& '$claudeQ'$debugArg$promptArg"
         )
         $stopAfterLaunch = [bool]($Req.stopLocal -and (Get-ServerStatus).running)
     } else {
@@ -402,24 +508,36 @@ function Start-ClaudeCode($Req) {
             "`$env:CLAUDE_CODE_ATTRIBUTION_HEADER = '0'",
             "`$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'",
             # Claude Code doesn't know local model names and would assume a 200k window and compact far too late.
-            "`$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = '$([int]$srv.ctx)'",
+            "`$env:CLAUDE_CODE_MAX_CONTEXT_TOKENS = '$([int]$srv.ctx)'"
+        )
+        # Opt-in (the tests use it): leave the Claude login's account connectors (Gmail, Calendar, travel, brokerage...)
+        # out of the session. They add ~100k tokens of tool definitions to every request, which a local model must
+        # read before answering. Normal launches keep them.
+        if ($Req.disableConnectors) { $lines += "`$env:ENABLE_CLAUDEAI_MCP_SERVERS = 'false'" }
+        $lines += @(
             "`$Host.UI.RawUI.WindowTitle = 'Claude Code - local: $alias'",
             "Write-Host 'Claude Code -> $($srv.baseUrl)  model: $alias' -ForegroundColor Cyan",
-            "& '$claudeQ'"
+            "& '$claudeQ'$debugArg$promptArg"
         )
     }
     Set-Content $script ($lines -join "`r`n") -Encoding utf8
     $pwsh = (Get-Process -Id $PID).Path
     $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
     $psArgs = @('-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Quote-Arg $script))
+    # Optional tab title (the tests use it): pinned so Claude Code can't rename the tab, which lets a caller find
+    # and close exactly this tab later. Restricted to plain characters; it ends up on a command line.
+    $tabTitle = ([string]$Req.tabTitle).Trim()
+    if ($tabTitle -and $tabTitle -notmatch '^[A-Za-z0-9 _.:\-]{1,80}$') { throw 'tabTitle may only contain letters, digits, spaces and _ . : -' }
     if ($wt) {
-        Start-Process $wt.Source -ArgumentList (@('-d', (Quote-Arg $dir), $pwsh) + $psArgs)
+        $wtArgs = @('-d', (Quote-Arg $dir))
+        if ($tabTitle) { $wtArgs += @('--title', (Quote-Arg $tabTitle), '--suppressApplicationTitle') }
+        Start-Process $wt.Source -ArgumentList ($wtArgs + @($pwsh) + $psArgs)
     } else {
         Start-Process $pwsh -ArgumentList $psArgs -WorkingDirectory $dir
     }
     # Only stop the local model once the cloud session has actually been launched.
     if ($stopAfterLaunch) { Stop-LlamaServer }
-    return @{ launched = $true; mode = $mode; dir = $dir; claude = $claude; stoppedLocal = $stopAfterLaunch }
+    return @{ launched = $true; mode = $mode; dir = $dir; claude = $claude; stoppedLocal = $stopAfterLaunch; debugLog = $debugPath }
 }
 
 # ---- Hugging Face discovery -------------------------------------------------
@@ -825,6 +943,10 @@ function Invoke-Api($Ctx, [string]$Method, [string]$Path) {
             return $st
         }
         'POST /api/server/force-stop' { return Stop-AllLlamaServers }
+        'GET /api/tune' { return Get-TuneStatus }
+        'POST /api/tune/start' { return Start-AutoTune (Read-Body $Ctx) }
+        'POST /api/tune/cancel' { Stop-AutoTune; return Get-TuneStatus }
+        'POST /api/tune/reset' { $b = Read-Body $Ctx; Reset-Tuning ([string]$b.model); return @{ ok = $true } }
         'GET /api/logs' { $n = [int]($q['lines'] ?? 80); return @{ lines = @((Get-LogTail $LogErr $n) + (Get-LogTail $LogOut 10) | Select-Object -Last $n) } }
         'GET /api/projects' { return @{ root = $script:S.projectsDir; projects = @(Get-ProjectsView) } }
         'GET /api/discover' { return Get-DiscoverView }

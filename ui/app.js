@@ -42,6 +42,7 @@ const S = {
   opts: JSON.parse(localStorage.getItem('launchOpts2') || '{"ctx":"auto","kvQuant":"auto","vision":false,"extraArgs":"","project":""}'),
   filters: { q: '', fitOnly: true, hideVariants: true, trustedOnly: false, sort: 'rec' },
 };
+const MARGIN_DEFAULT = 1000, MARGIN_CHOICES = [[512, '0.5 GB (fastest, tight)'], [MARGIN_DEFAULT, '1 GB (default)'], [1500, '1.5 GB'], [2000, '2 GB (safest)']];
 const saveOpts = () => localStorage.setItem('launchOpts2', JSON.stringify(S.opts));
 
 // ---- data loading ----------------------------------------------------------
@@ -65,6 +66,21 @@ async function loadLogs() {
   const box = $('#logBox'); const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
   box.textContent = lines.length ? lines.join('\n') : 'No output yet.';
   if (atEnd) box.scrollTop = box.scrollHeight;
+}
+// ---- autotune status ---------------------------------------------------------
+let tuneTimer;
+async function loadTune() {
+  const prev = S.tune?.state, before = JSON.stringify(S.tune);
+  S.tune = await api('/api/tune');
+  if (JSON.stringify(S.tune) !== before) renderLaunch();
+  if (prev === 'running' && S.tune.state !== 'running') {
+    toast(S.tune.state === 'done' ? `Autotune finished: ${S.tune.message}` : `Autotune ${S.tune.state}: ${S.tune.message || ''}`, S.tune.state === 'error');
+    await loadModels();
+  }
+}
+function pollTune() {
+  clearTimeout(tuneTimer);
+  tuneTimer = setTimeout(async () => { try { await loadTune(); } catch { } if (S.tune?.state === 'running') pollTune(); }, 3000);
 }
 async function loadProjects() { const r = await api('/api/projects'); S.projects = r.projects; S.projectsRoot = r.root; renderLaunch(); }
 async function loadDiscover() { S.discover = await api('/api/discover'); renderDiscover(); renderCounts(); }
@@ -188,7 +204,9 @@ function renderLaunch() {
   } else {
     c.append(h('div', { class: 'sel-model' }, h('div', { class: 'meta' }, 'Select an installed model to begin.')));
   }
-  if (srv.state === 'exited' && srv.error) c.append(h('div', { class: 'note error' }, h('strong', {}, 'Server exited'), h('pre', { style: 'margin:0;white-space:pre-wrap;font-size:12px;max-height:120px;overflow:auto' }, srv.error)));
+  if (srv.state === 'exited' && srv.error) c.append(h('div', { class: 'note error' }, h('strong', {}, 'Server exited'),
+    srv.tuned ? h('div', { style: 'margin-bottom:6px' }, 'This launch used tuned settings. If other programs are now using more GPU memory than when it was tuned, untick "Use tuned settings" or re-run the autotune.') : null,
+    h('pre', { style: 'margin:0;white-space:pre-wrap;font-size:12px;max-height:120px;overflow:auto' }, srv.error)));
 
   if (!busy) {
     // Context window: "Auto" = the largest window this machine can hold for the selected model (256k when feasible).
@@ -218,14 +236,54 @@ function renderLaunch() {
     c.append(h('div', { class: 'field' }, h('label', {}, 'KV cache'), kvSel));
     if (m?.templatePatch) c.append(h('div', { class: 'hint', style: 'margin:-4px 0 12px;font-size:12px;color:var(--muted)' },
       "This model's chat template rejects Claude Code's mid-conversation system message, so the dashboard starts it with a patched copy."));
+    // Speed tuning: measures real launch settings (GPU/CPU split, batch size, threads) on this machine and remembers
+    // the fastest safe combination for this model + context + KV type.
+    const tn = S.tune || { state: 'idle' };
+    const kvEff = S.opts.kvQuant === 'auto' ? !!cur?.kvQuant : S.opts.kvQuant;
+    const rec = m && cur ? (m.tunings || []).find(t => t.ctx === cur.ctx && !!t.kvQuant === !!kvEff) : null;
+    const tuneBox = h('div', { class: 'tune' }, h('div', { class: 'tune-title' }, 'Speed tuning'));
+    const runTune = quick => guard(async () => {
+      await api('/api/tune/start', { modelPath: m.path, ctx: S.opts.ctx, kvQuant: S.opts.kvQuant, quick, marginMiB: margin });
+      toast('Autotune started - this takes several minutes.'); await loadTune(); pollTune();
+    });
+    // A stored value that is not one of the choices (old build, edited storage) snaps to the nearest choice.
+    const margin = MARGIN_CHOICES.map(c => c[0]).reduce((a, b) => Math.abs(b - (S.opts.marginMiB || MARGIN_DEFAULT)) < Math.abs(a - (S.opts.marginMiB || MARGIN_DEFAULT)) ? b : a);
+    const marginSel = h('label', { class: 'check', title: 'VRAM a tuned setup must leave free. Lower = faster but less headroom for other programs. Applies to the next autotune run, not to an existing result.' }, 'Keep free VRAM (next autotune): ',
+      h('select', { onchange: e => { S.opts.marginMiB = Number(e.target.value); saveOpts(); renderLaunch(); } },
+        ...MARGIN_CHOICES.map(([v, t]) => h('option', { value: v, selected: margin === v }, t))));
+    const pct = v => (v > 0 ? '+' : '') + v + '%';
+    if (tn.state === 'running') {
+      tuneBox.append(h('div', { class: 'progress' }, h('div', { style: `width:${tn.steps ? Math.min(95, Math.max(4, tn.step / tn.steps * 100)) : 6}%` })),
+        h('div', { class: 'meta' }, `${tn.model}: ${tn.message || 'working...'}`),
+        h('button', { class: 'btn small', onclick: guard(async () => { await api('/api/tune/cancel', {}); await loadTune(); }) }, 'Cancel'));
+    } else if (rec && rec.applied) {
+      const useT = h('input', { type: 'checkbox', checked: S.opts.useTuned !== false, onchange: e => { S.opts.useTuned = e.target.checked; saveOpts(); } });
+      tuneBox.append(h('div', { class: 'meta' }, `Reading prompts ${pct(rec.gainPromptPct)} (${Math.round(rec.baseline.prompt).toLocaleString()} → ${Math.round(rec.tuned.prompt).toLocaleString()} tok/s), writing ${pct(rec.gainGenPct)} (${rec.baseline.gen} → ${rec.tuned.gen} tok/s).`),
+        h('label', { class: 'check' }, useT, 'Use tuned settings'),
+        h('div', { class: 'hint-code' }, rec.cliArgs.join(' ')),
+        h('div', { class: 'meta' }, `Tuned keeping at least ${rec.marginMiB || MARGIN_DEFAULT} MiB of VRAM free.`), marginSel,
+        h('div', { class: 'row' }, h('button', { class: 'btn small', onclick: runTune(false) }, 'Re-run'),
+          h('button', { class: 'btn small ghost', onclick: guard(async () => { await api('/api/tune/reset', { model: m.name }); await loadModels(); }) }, 'Reset')));
+    } else if (rec) {
+      tuneBox.append(h('div', { class: 'meta' }, 'Tested on this machine: nothing beat the default by a meaningful margin, so the default is kept.'),
+        marginSel,
+        h('div', { class: 'row' }, h('button', { class: 'btn small', onclick: runTune(false) }, 'Re-run'),
+          h('button', { class: 'btn small ghost', onclick: guard(async () => { await api('/api/tune/reset', { model: m.name }); await loadModels(); }) }, 'Reset')));
+    } else {
+      tuneBox.append(h('div', { class: 'meta' }, `Not tuned yet for ${cur ? k(cur.ctx) : 'this'} context. Tries a few GPU/CPU split, batch-size and thread settings and keeps the fastest safe combination (about 5-10 minutes; needs the GPU free).`),
+        marginSel,
+        h('button', { class: 'btn small', disabled: !m || !S.app?.llama.found || !cur, onclick: runTune(false) }, 'Autotune this model'));
+      if (tn.state === 'error' || tn.state === 'cancelled') tuneBox.append(h('div', { class: 'meta', style: 'color:var(--warn)' }, `Last run: ${tn.message || tn.state}`));
+    }
+    c.append(tuneBox);
     if (m?.mmproj) {
       const vis = h('input', { type: 'checkbox', checked: S.opts.vision, onchange: e => { S.opts.vision = e.target.checked; saveOpts(); } });
       c.append(h('label', { class: 'check' }, vis, 'Enable image input (loads vision projector)'));
     }
     const extra = h('input', { type: 'text', value: S.opts.extraArgs, placeholder: 'e.g. --n-cpu-moe 12', oninput: e => { S.opts.extraArgs = e.target.value; saveOpts(); } });
     c.append(h('details', { class: 'adv' }, h('summary', {}, 'Advanced'), h('div', { class: 'field' }, h('label', {}, 'Extra llama-server arguments'), extra)));
-    c.append(h('button', { class: 'btn primary wide', disabled: !m || !S.app?.llama.found, onclick: guard(async () => {
-      await api('/api/server/start', { modelPath: m.path, ctx: S.opts.ctx, kvQuant: S.opts.kvQuant, vision: S.opts.vision && !!m.mmproj, extraArgs: S.opts.extraArgs });
+    c.append(h('button', { class: 'btn primary wide', disabled: !m || !S.app?.llama.found || tn.state === 'running', title: tn.state === 'running' ? 'An autotune is running' : '', onclick: guard(async () => {
+      await api('/api/server/start', { modelPath: m.path, ctx: S.opts.ctx, kvQuant: S.opts.kvQuant, useTuned: S.opts.useTuned !== false, vision: S.opts.vision && !!m.mmproj, extraArgs: S.opts.extraArgs });
       toast('Starting model...'); await loadServer(); renderInstalled(); $('#cardLogs').open = true;
     }) }, 'Start model'));
   } else {
@@ -445,7 +503,8 @@ $('#cardLogs').addEventListener('toggle', () => loadLogs());
 (async function boot() {
   try {
     await loadApp();
-    await Promise.all([loadModels(), loadServer(), loadProjects(), loadDiscover(), loadDownloads()]);
+    await Promise.all([loadModels(), loadServer(), loadProjects(), loadDiscover(), loadDownloads(), loadTune()]);
+    if (S.tune?.state === 'running') pollTune();
     if (S.discover.status?.state === 'running') pollDiscover();
   } catch (e) { toast('Cannot reach the dashboard server: ' + e.message, true); }
   setInterval(() => loadServer().catch(() => { }), 2500);
