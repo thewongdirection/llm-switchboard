@@ -42,6 +42,7 @@ const S = {
   opts: JSON.parse(localStorage.getItem('launchOpts2') || '{"ctx":"auto","kvQuant":"auto","vision":false,"extraArgs":"","project":""}'),
   filters: { q: '', fitOnly: true, hideVariants: true, trustedOnly: false, sort: 'rec' },
 };
+const MARGIN_DEFAULT = 1000, MARGIN_CHOICES = [[512, '0.5 GB (fastest, tight)'], [MARGIN_DEFAULT, '1 GB (default)'], [1500, '1.5 GB'], [2000, '2 GB (safest)']];
 const saveOpts = () => localStorage.setItem('launchOpts2', JSON.stringify(S.opts));
 
 // ---- data loading ----------------------------------------------------------
@@ -242,13 +243,14 @@ function renderLaunch() {
     const rec = m && cur ? (m.tunings || []).find(t => t.ctx === cur.ctx && !!t.kvQuant === !!kvEff) : null;
     const tuneBox = h('div', { class: 'tune' }, h('div', { class: 'tune-title' }, 'Speed tuning'));
     const runTune = quick => guard(async () => {
-      await api('/api/tune/start', { modelPath: m.path, ctx: S.opts.ctx, kvQuant: S.opts.kvQuant, quick, marginMiB: S.opts.marginMiB || 1000 });
+      await api('/api/tune/start', { modelPath: m.path, ctx: S.opts.ctx, kvQuant: S.opts.kvQuant, quick, marginMiB: margin });
       toast('Autotune started - this takes several minutes.'); await loadTune(); pollTune();
     });
-    const marginSel = h('label', { class: 'check', title: 'VRAM a tuned setup must leave free. Lower = faster but less headroom for other programs.' }, 'Keep free VRAM: ',
+    // A stored value that is not one of the choices (old build, edited storage) snaps to the nearest choice.
+    const margin = MARGIN_CHOICES.map(c => c[0]).reduce((a, b) => Math.abs(b - (S.opts.marginMiB || MARGIN_DEFAULT)) < Math.abs(a - (S.opts.marginMiB || MARGIN_DEFAULT)) ? b : a);
+    const marginSel = h('label', { class: 'check', title: 'VRAM a tuned setup must leave free. Lower = faster but less headroom for other programs. Applies to the next autotune run, not to an existing result.' }, 'Keep free VRAM (next autotune): ',
       h('select', { onchange: e => { S.opts.marginMiB = Number(e.target.value); saveOpts(); renderLaunch(); } },
-        ...[[512, '0.5 GB (fastest, tight)'], [1000, '1 GB (default)'], [1500, '1.5 GB'], [2000, '2 GB (safest)']].map(([v, t]) =>
-          h('option', { value: v, selected: (S.opts.marginMiB || 1000) === v }, t))));
+        ...MARGIN_CHOICES.map(([v, t]) => h('option', { value: v, selected: margin === v }, t))));
     const pct = v => (v > 0 ? '+' : '') + v + '%';
     if (tn.state === 'running') {
       tuneBox.append(h('div', { class: 'progress' }, h('div', { style: `width:${tn.steps ? Math.min(95, Math.max(4, tn.step / tn.steps * 100)) : 6}%` })),
@@ -259,7 +261,7 @@ function renderLaunch() {
       tuneBox.append(h('div', { class: 'meta' }, `Reading prompts ${pct(rec.gainPromptPct)} (${Math.round(rec.baseline.prompt).toLocaleString()} → ${Math.round(rec.tuned.prompt).toLocaleString()} tok/s), writing ${pct(rec.gainGenPct)} (${rec.baseline.gen} → ${rec.tuned.gen} tok/s).`),
         h('label', { class: 'check' }, useT, 'Use tuned settings'),
         h('div', { class: 'hint-code' }, rec.cliArgs.join(' ')),
-        h('div', { class: 'meta' }, `Tuned keeping at least ${rec.marginMiB || 1000} MiB of VRAM free.`), marginSel,
+        h('div', { class: 'meta' }, `Tuned keeping at least ${rec.marginMiB || MARGIN_DEFAULT} MiB of VRAM free.`), marginSel,
         h('div', { class: 'row' }, h('button', { class: 'btn small', onclick: runTune(false) }, 'Re-run'),
           h('button', { class: 'btn small ghost', onclick: guard(async () => { await api('/api/tune/reset', { model: m.name }); await loadModels(); }) }, 'Reset')));
     } else if (rec) {

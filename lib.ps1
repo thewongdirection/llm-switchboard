@@ -98,7 +98,7 @@ function Get-ModelScore([double]$ParamsB, [bool]$IsMoe, $Fit) {
 $script:MarginMinMiB = 256; $script:MarginMaxMiB = 4096; $script:MarginDefaultMiB = 1000
 
 function Get-MarginMiB($Value) {
-    $n = 0
-    if ($null -eq $Value -or -not [int]::TryParse([string]$Value, [ref]$n)) { return $script:MarginDefaultMiB }
-    return [math]::Min($script:MarginMaxMiB, [math]::Max($script:MarginMinMiB, $n))
+    $n = 0.0
+    if ($null -eq $Value -or -not [double]::TryParse(([string]$Value).Trim(), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -or [double]::IsNaN($n)) { return $script:MarginDefaultMiB }
+    return [int][math]::Min($script:MarginMaxMiB, [math]::Max($script:MarginMinMiB, [math]::Round($n)))
 }
